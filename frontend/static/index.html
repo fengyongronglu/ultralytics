@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>YOLOv8 In-Browser (ONNXRuntime-Web + WebGPU)</title>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+  <style>
+    body
+    {
+      font-family: Arial, sans-serif;
+    }
+    canvas
+    {
+      border: 1px solid #ccc;
+      max-width: 100%;
+      height: auto;
+    }
+    #bar
+    {
+      margin: 8px 0;
+    }
+  </style>
+</head>
+<body>
+  <h3>YOLOv8 In Browser (ONNX + WebGPU)</h3>
+  <div id="bar">
+    <input type="file" id="fileInput" accept="image/*">
+    <label>conf</label>
+    <input id="conf" type="number" step="0.01" value="0.25" style="width:64px;">
+    <label>iou</label>
+    <input id="iou" type="number" step="0.01" value="0.45" style="width:64px;">
+  </div>
+  <canvas id="view"></canvas>
+
+  <script>
+    const modelPath = "models/yolov8n.onnx";
+    const INPUT_SIZE = 640;
+    const PAD_VALUE = 114;
+
+    // COCO80 类别名（可换成自己的）
+    const classNames = ["person","bicycle","car","motorcycle","airplane","bus","train","truck","boat","traffic light",
+      "fire hydrant","stop sign","parking meter","bench","bird","cat","dog","horse","sheep","cow",
+      "elephant","bear","zebra","giraffe","backpack","umbrella","handbag","tie","suitcase","frisbee",
+      "skis","snowboard","sports ball","kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket",
+      "bottle","wine glass","cup","fork","knife","spoon","bowl","banana","apple","sandwich","orange",
+      "broccoli","carrot","hot dog","pizza","donut","cake","chair","couch","potted plant","bed",
+      "dining table","toilet","tv","laptop","mouse","remote","keyboard","cell phone","microwave","oven",
+      "toaster","sink","refrigerator","book","clock","vase","scissors","teddy bear","hair drier","toothbrush"];
+
+    let session;
+
+    async function init()
+    {
+      session = await ort.InferenceSession.create(
+        modelPath,
+        {
+          executionProviders: ['webgpu', 'wasm']  // 优先 WebGPU，回落 WASM
+        }
+      );
+      console.log("Model loaded. inputs:", session.inputNames, "outputs:", session.outputNames);
+    }
+
+    // letterbox 预处理：保持纵横比缩放到 640，再居中灰边填充到 640×640
+    function letterbox(image, newShape = INPUT_SIZE)
+    {
+      const iw = image.naturalWidth || image.videoWidth || image.width;
+      const ih = image.naturalHeight || image.videoHeight || image.height;
+
+      const r = Math.min(newShape / iw, newShape / ih);
+      const newW = Math.round(iw * r);
+      const newH = Math.round(ih * r);
+
+      const dw = Math.floor((newShape - newW) / 2);
+      const dh = Math.floor((newShape - newH) / 2);
+
+      const off = document.createElement("canvas");
+      off.width = newShape;
+      off.height = newShape;
+      const ctx = off.getContext("2d");
+
+      ctx.fillStyle = `rgb(${PAD_VALUE},${PAD_VALUE},${PAD_VALUE})`;
+      ctx.fillRect(0, 0, newShape, newShape);
+      ctx.drawImage(image, 0, 0, iw, ih, dw, dh, newW, newH);
+
+      const imgData = ctx.getImageData(0, 0, newShape, newShape).data;
+
+      const input = new Float32Array(1 * 3 * newShape * newShape);
+      // HWC -> CHW, [0,255] -> [0,1]
+      let p = 0;
+      const area = newShape * newShape;
+      for (let y = 0; y < newShape; y++)
+      {
+        for (let x = 0; x < newShape; x++)
+        {
+          const i = (y * newShape + x) * 4;
+          const rch = imgData[i] / 255.0;
+          const gch = imgData[i + 1] / 255.0;
+          const bch = imgData[i + 2] / 255.0;
+
+          input[y * newShape + x] = rch;
+          input[area + y * newShape + x] = gch;
+          input[2 * area + y * newShape + x] = bch;
+
+          p += 3;
+        }
+      }
+
+      return {
+        tensor: new ort.Tensor("float32", input, [1, 3, newShape, newShape]),
+        ratio: r,
+        dw,
+        dh,
+        iw,
+        ih
+      };
+    }
+
+    // 解析 YOLOv8 输出，兼容 [1,84,N] 与 [1,N,84]
+    function parseDetections(outputTensor, confThres)
+    {
+      const data = outputTensor.data;
+      const dims = outputTensor.dims; // e.g. [1,84,8400] 或 [1,8400,84]
+
+      let N, getVal;
+      if (dims.length === 3 && dims[1] === 84)
+      {
+        // [1,84,N]
+        N = dims[2];
+        getVal = (row, col) => data[row * N + col];
+      }
+      else if (dims.length === 3 && dims[2] === 84)
+      {
+        // [1,N,84]
+        N = dims[1];
+        getVal = (row, col) => data[col + row * 84];
+      }
+      else
+      {
+        throw new Error(`Unexpected output shape: ${dims}`);
+      }
+
+      const boxes = [];
+      const scores = [];
+      const labels = [];
+
+      for (let i = 0; i < N; i++)
+      {
+        // YOLOv8: [x,y,w,h] + [80 类分数]，无独立 objectness
+        const x = getVal(0, i);
+        const y = getVal(1, i);
+        const w = getVal(2, i);
+        const h = getVal(3, i);
+
+        // 找到最大类别概率
+        let best = -1;
+        let bestScore = 0.0;
+        for (let c = 4; c < 84; c++)
+        {
+          const sc = getVal(c, i);
+          if (sc > bestScore)
+          {
+            bestScore = sc;
+            best = c - 4;
+          }
+        }
+
+        if (bestScore < confThres)
+        {
+          continue;
+        }
+
+        const x1 = x - w / 2.0;
+        const y1 = y - h / 2.0;
+        const x2 = x + w / 2.0;
+        const y2 = y + h / 2.0;
+
+        boxes.push([x1, y1, x2, y2]);
+        scores.push(bestScore);
+        labels.push(best);
+      }
+
+      return { boxes, scores, labels };
+    }
+
+    function iou(a, b)
+    {
+      const ax1 = a[0], ay1 = a[1], ax2 = a[2], ay2 = a[3];
+      const bx1 = b[0], by1 = b[1], bx2 = b[2], by2 = b[3];
+
+      const interX1 = Math.max(ax1, bx1);
+      const interY1 = Math.max(ay1, by1);
+      const interX2 = Math.min(ax2, bx2);
+      const interY2 = Math.min(ay2, by2);
+
+      const interW = Math.max(0, interX2 - interX1);
+      const interH = Math.max(0, interY2 - interY1);
+      const interArea = interW * interH;
+
+      const aArea = Math.max(0, ax2 - ax1) * Math.max(0, ay2 - ay1);
+      const bArea = Math.max(0, bx2 - bx1) * Math.max(0, by2 - by1);
+
+      const union = aArea + bArea - interArea + 1e-6;
+      return interArea / union;
+    }
+
+    function nms(boxes, scores, iouThres)
+    {
+      const order = scores.map((s, i) => [s, i]).sort((a, b) => b[0] - a[0]).map(x => x[1]);
+      const keep = [];
+
+      while (order.length)
+      {
+        const i = order.shift();
+        keep.push(i);
+
+        for (let j = order.length - 1; j >= 0; j--)
+        {
+          const o = order[j];
+          if (iou(boxes[i], boxes[o]) >= iouThres)
+          {
+            order.splice(j, 1);
+          }
+        }
+      }
+      return keep;
+    }
+
+    function scaleBoxesBack(boxes, ratio, dw, dh, iw, ih)
+    {
+      // 从 640 letterbox 坐标映射回原图
+      const out = [];
+      for (const b of boxes)
+      {
+        let x1 = (b[0] - dw) / ratio;
+        let y1 = (b[1] - dh) / ratio;
+        let x2 = (b[2] - dw) / ratio;
+        let y2 = (b[3] - dh) / ratio;
+
+        x1 = Math.max(0, Math.min(iw - 1, x1));
+        y1 = Math.max(0, Math.min(ih - 1, y1));
+        x2 = Math.max(0, Math.min(iw - 1, x2));
+        y2 = Math.max(0, Math.min(ih - 1, y2));
+
+        out.push([x1, y1, x2, y2]);
+      }
+      return out;
+    }
+
+    async function runOnImage(image)
+    {
+      const confThres = parseFloat(document.getElementById("conf").value) || 0.25;
+      const iouThres = parseFloat(document.getElementById("iou").value) || 0.45;
+
+      const pre = letterbox(image, INPUT_SIZE);
+
+      const inputName = session.inputNames && session.inputNames.length
+        ? session.inputNames[0]
+        : "images";
+
+      const feeds = { };
+      feeds[inputName] = pre.tensor;
+
+      const results = await session.run(feeds);
+      const outName = session.outputNames[0];
+      const outTensor = results[outName];
+
+      const parsed = parseDetections(outTensor, confThres);
+      const keep = nms(parsed.boxes, parsed.scores, iouThres);
+
+      // 映射回原图坐标
+      const keptBoxes = keep.map(i => parsed.boxes[i]);
+      const keptScores = keep.map(i => parsed.scores[i]);
+      const keptLabels = keep.map(i => parsed.labels[i]);
+      const scaled = scaleBoxesBack(keptBoxes, pre.ratio, pre.dw, pre.dh, pre.iw, pre.ih);
+
+      // 绘制到原图尺寸的画布
+      const canvas = document.getElementById("view");
+      canvas.width = pre.iw;
+      canvas.height = pre.ih;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(image, 0, 0, pre.iw, pre.ih);
+
+      ctx.lineWidth = 2;
+      ctx.font = "14px Arial";
+
+      for (let i = 0; i < scaled.length; i++)
+      {
+        const [x1, y1, x2, y2] = scaled[i];
+        const label = (classNames[keptLabels[i]] ?? `id:${keptLabels[i]}`);
+        const score = keptScores[i].toFixed(2);
+
+        ctx.strokeStyle = "#00e";
+        ctx.fillStyle = "rgba(0,0,238,0.15)";
+        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+        ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+
+        const tag = `${label} ${score}`;
+        ctx.fillStyle = "#00e";
+        ctx.fillRect(x1, Math.max(0, y1 - 18), ctx.measureText(tag).width + 8, 18);
+        ctx.fillStyle = "#fff";
+        ctx.fillText(tag, x1 + 4, Math.max(12, y1 - 4));
+      }
+    }
+
+    document.getElementById("fileInput").addEventListener("change", ev =>
+    {
+      const file = ev.target.files[0];
+      if (!file)
+      {
+        return;
+      }
+      const img = new Image();
+      img.onload = () =>
+      {
+        runOnImage(img);
+      };
+      img.src = URL.createObjectURL(file);
+    });
+
+    init();
+  </script>
+</body>
+</html>
