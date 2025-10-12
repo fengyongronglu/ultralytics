@@ -33,19 +33,12 @@
   <canvas id="view"></canvas>
 
   <script>
-    const modelPath = "models/yolov8n.onnx";
+    const modelPath = "models/car_detection.onnx";
     const INPUT_SIZE = 640;
     const PAD_VALUE = 114;
 
     // COCO80 类别名（可换成自己的）
-    const classNames = ["person","bicycle","car","motorcycle","airplane","bus","train","truck","boat","traffic light",
-      "fire hydrant","stop sign","parking meter","bench","bird","cat","dog","horse","sheep","cow",
-      "elephant","bear","zebra","giraffe","backpack","umbrella","handbag","tie","suitcase","frisbee",
-      "skis","snowboard","sports ball","kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket",
-      "bottle","wine glass","cup","fork","knife","spoon","bowl","banana","apple","sandwich","orange",
-      "broccoli","carrot","hot dog","pizza","donut","cake","chair","couch","potted plant","bed",
-      "dining table","toilet","tv","laptop","mouse","remote","keyboard","cell phone","microwave","oven",
-      "toaster","sink","refrigerator","book","clock","vase","scissors","teddy bear","hair drier","toothbrush"];
+    const classNames = ["car"];
 
     let session;
 
@@ -115,72 +108,60 @@
       };
     }
 
-    // 解析 YOLOv8 输出，兼容 [1,84,N] 与 [1,N,84]
-    function parseDetections(outputTensor, confThres)
-    {
-      const data = outputTensor.data;
-      const dims = outputTensor.dims; // e.g. [1,84,8400] 或 [1,8400,84]
+     // 解析 YOLOv8 输出，适配单类别模型 [1,5,N] 或 [1,N,5]
+     function parseDetections(outputTensor, confThres)
+     {
+       const data = outputTensor.data;
+       const dims = outputTensor.dims; // e.g. [1,5,8400] 或 [1,8400,5]
 
-      let N, getVal;
-      if (dims.length === 3 && dims[1] === 84)
-      {
-        // [1,84,N]
-        N = dims[2];
-        getVal = (row, col) => data[row * N + col];
-      }
-      else if (dims.length === 3 && dims[2] === 84)
-      {
-        // [1,N,84]
-        N = dims[1];
-        getVal = (row, col) => data[col + row * 84];
-      }
-      else
-      {
-        throw new Error(`Unexpected output shape: ${dims}`);
-      }
+       let N, getVal;
+       if (dims.length === 3 && dims[1] === 5)
+       {
+         // [1,5,N]
+         N = dims[2];
+         getVal = (row, col) => data[row * N + col];
+       }
+       else if (dims.length === 3 && dims[2] === 5)
+       {
+         // [1,N,5]
+         N = dims[1];
+         getVal = (row, col) => data[col + row * 5];
+       }
+       else
+       {
+         throw new Error(`Unexpected output shape: ${dims}`);
+       }
 
-      const boxes = [];
-      const scores = [];
-      const labels = [];
+       const boxes = [];
+       const scores = [];
+       const labels = [];
 
-      for (let i = 0; i < N; i++)
-      {
-        // YOLOv8: [x,y,w,h] + [80 类分数]，无独立 objectness
-        const x = getVal(0, i);
-        const y = getVal(1, i);
-        const w = getVal(2, i);
-        const h = getVal(3, i);
+       for (let i = 0; i < N; i++)
+       {
+         // 单类别模型: [x,y,w,h,conf]
+         const x = getVal(0, i);
+         const y = getVal(1, i);
+         const w = getVal(2, i);
+         const h = getVal(3, i);
+         const conf = getVal(4, i);
 
-        // 找到最大类别概率
-        let best = -1;
-        let bestScore = 0.0;
-        for (let c = 4; c < 84; c++)
-        {
-          const sc = getVal(c, i);
-          if (sc > bestScore)
-          {
-            bestScore = sc;
-            best = c - 4;
-          }
-        }
+         if (conf < confThres)
+         {
+           continue;
+         }
 
-        if (bestScore < confThres)
-        {
-          continue;
-        }
+         const x1 = x - w / 2.0;
+         const y1 = y - h / 2.0;
+         const x2 = x + w / 2.0;
+         const y2 = y + h / 2.0;
 
-        const x1 = x - w / 2.0;
-        const y1 = y - h / 2.0;
-        const x2 = x + w / 2.0;
-        const y2 = y + h / 2.0;
+         boxes.push([x1, y1, x2, y2]);
+         scores.push(conf);
+         labels.push(0); // 只有car一个类别，标签固定为0
+       }
 
-        boxes.push([x1, y1, x2, y2]);
-        scores.push(bestScore);
-        labels.push(best);
-      }
-
-      return { boxes, scores, labels };
-    }
+       return { boxes, scores, labels };
+     }
 
     function iou(a, b)
     {
@@ -257,12 +238,32 @@
         ? session.inputNames[0]
         : "images";
 
-      const feeds = { };
-      feeds[inputName] = pre.tensor;
+       const feeds = { };
+       feeds[inputName] = pre.tensor;
 
-      const results = await session.run(feeds);
-      const outName = session.outputNames[0];
-      const outTensor = results[outName];
+       // 运行10次推理取平均值
+       const numRuns = 10;
+       let totalTime = 0;
+       let results;
+       
+       console.log(`开始运行${numRuns}次推理...`);
+       
+       for (let i = 0; i < numRuns; i++) {
+         const startTime = performance.now();
+         results = await session.run(feeds);
+         const endTime = performance.now();
+         const inferenceTime = endTime - startTime;
+         totalTime += inferenceTime;
+         
+         console.log(`第${i + 1}次推理耗时: ${inferenceTime.toFixed(2)}ms`);
+       }
+       
+       const avgInferenceTime = totalTime / numRuns;
+       console.log(`平均推理耗时: ${avgInferenceTime.toFixed(2)}ms`);
+       console.log(`总耗时: ${totalTime.toFixed(2)}ms`);
+       
+       const outName = session.outputNames[0];
+       const outTensor = results[outName];
 
       const parsed = parseDetections(outTensor, confThres);
       const keep = nms(parsed.boxes, parsed.scores, iouThres);
@@ -273,15 +274,23 @@
       const keptLabels = keep.map(i => parsed.labels[i]);
       const scaled = scaleBoxesBack(keptBoxes, pre.ratio, pre.dw, pre.dh, pre.iw, pre.ih);
 
-      // 绘制到原图尺寸的画布
-      const canvas = document.getElementById("view");
-      canvas.width = pre.iw;
-      canvas.height = pre.ih;
-      const ctx = canvas.getContext("2d");
-      ctx.drawImage(image, 0, 0, pre.iw, pre.ih);
+       // 绘制到原图尺寸的画布
+       const canvas = document.getElementById("view");
+       canvas.width = pre.iw;
+       canvas.height = pre.ih;
+       const ctx = canvas.getContext("2d");
+       ctx.drawImage(image, 0, 0, pre.iw, pre.ih);
+       
+       // 在画布上显示推理耗时
+       ctx.fillStyle = "rgba(0,0,0,0.7)";
+       ctx.fillRect(10, 10, 250, 50);
+       ctx.fillStyle = "#fff";
+       ctx.font = "14px Arial";
+       ctx.fillText(`平均推理耗时: ${avgInferenceTime.toFixed(2)}ms`, 15, 28);
+       ctx.fillText(`运行次数: ${numRuns}次`, 15, 45);
 
-      ctx.lineWidth = 2;
-      ctx.font = "14px Arial";
+       ctx.lineWidth = 2;
+       ctx.font = "14px Arial";
 
       for (let i = 0; i < scaled.length; i++)
       {
